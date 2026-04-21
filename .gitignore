@@ -1,0 +1,13 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.idea/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+*.swp
+.DS_Store

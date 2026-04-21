@@ -1,0 +1,17 @@
+[Unit]
+Description=Squirrel cam viewer
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+WorkingDirectory=/home/pi/Esp32-squirrel-cam/pi_viewer
+ExecStart=/usr/bin/python3 /home/pi/Esp32-squirrel-cam/pi_viewer/squirrel_viewer.py --host squirrelcam.local
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
