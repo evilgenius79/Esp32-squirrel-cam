@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "wifi.c"
+        "camera.c"
+        "thermal.c"
+        "http_server.c"
+        "mlx90640_driver.c"
+    INCLUDE_DIRS
+        "."
+    EMBED_FILES
+        "web/index.html"
+)

@@ -1,0 +1,21 @@
+## Managed components pulled from the ESP Component Registry.
+##
+## NOTE: version constraints reflect what was current when this was written.
+## If a newer ESP-IDF release bumps compatible versions, adjust below.
+
+dependencies:
+  idf:
+    version: ">=5.4"
+
+  # WiFi via the onboard ESP32-C6 co-processor over SDIO.
+  espressif/esp_wifi_remote: "^0.9"
+  espressif/esp_hosted: "^2.0"
+
+  # MIPI-CSI camera sensor drivers (OV5647 is included in this bundle).
+  espressif/esp_cam_sensor: "^1.0"
+
+  # Wrapper around the P4's hardware JPEG codec block.
+  # Some IDF versions expose this directly via `esp_driver_jpeg`; if the
+  # registry component is unavailable, drop this line and include
+  # <driver/jpeg_encode.h> from IDF directly.
+  # espressif/esp_new_jpeg: "^0.6"

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Squirrel cam</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0b0b0e; color: #e5e5e5;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 0.4em 0.9em; background: #14141a; border-bottom: 1px solid #222;
+  }
+  h1 { margin: 0; font-size: 1.05rem; font-weight: 600; letter-spacing: 0.02em; }
+  .stats { font-size: 0.85rem; color: #9aa; font-variant-numeric: tabular-nums; }
+
+  main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 6px;
+    height: calc(100% - 2.3em);
+  }
+  .panel {
+    position: relative;
+    background: #000;
+    border-radius: 6px;
+    overflow: hidden;
+    min-height: 200px;
+  }
+  .panel img, .panel canvas {
+    display: block;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    image-rendering: pixelated;  /* crisp nearest-neighbour for the heatmap */
+  }
+  .panel .overlay {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 4px 8px;
+    background: linear-gradient(to top, rgba(0,0,0,0.7), rgba(0,0,0,0));
+    font-size: 0.8rem; color: #ddd;
+    display: flex; justify-content: space-between; pointer-events: none;
+  }
+  .panel .label {
+    position: absolute; left: 8px; top: 6px;
+    font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: #9aa; background: rgba(0,0,0,0.45); padding: 2px 6px; border-radius: 3px;
+  }
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Squirrel cam</h1>
+  <div class="stats">
+    <span id="fps">-- fps</span> &middot;
+    <span id="trange">thermal --</span> &middot;
+    <a href="/snapshot" style="color:#6af">snap</a>
+  </div>
+</header>
+<main>
+  <div class="panel">
+    <span class="label">video</span>
+    <img id="vid" src="/stream" alt="live video">
+  </div>
+  <div class="panel">
+    <span class="label">thermal</span>
+    <canvas id="therm" width="32" height="24"></canvas>
+    <div class="overlay">
+      <span id="tmin">--&deg;C</span>
+      <span id="tmax">--&deg;C</span>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const canvas = document.getElementById('therm');
+  const ctx = canvas.getContext('2d');
+  const W = 32, H = 24;
+  const img = ctx.createImageData(W, H);
+
+  // Approximation of matplotlib's "inferno" colormap: 64 stops, 4 bytes each.
+  // Keeps the page small and doesn't require any assets.
+  const STOPS = [
+    [0,0,4],[10,6,23],[24,12,47],[40,17,69],[58,22,87],[77,24,99],
+    [96,27,106],[114,31,108],[133,34,106],[151,39,103],[170,44,97],
+    [188,52,90],[205,61,82],[220,73,72],[233,88,62],[243,104,52],
+    [250,122,42],[253,142,33],[253,164,26],[249,186,28],[242,208,44],
+    [233,229,73],[228,248,111],[252,254,164]
+  ];
+  function lut(t) {
+    t = Math.max(0, Math.min(1, t));
+    const idx = t * (STOPS.length - 1);
+    const i = Math.floor(idx), f = idx - i;
+    const a = STOPS[i], b = STOPS[Math.min(i + 1, STOPS.length - 1)];
+    return [
+      a[0] + (b[0] - a[0]) * f | 0,
+      a[1] + (b[1] - a[1]) * f | 0,
+      a[2] + (b[2] - a[2]) * f | 0,
+    ];
+  }
+
+  async function pollThermal() {
+    try {
+      const r = await fetch('/thermal', { cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      const data = j.data, min = j.min, max = j.max;
+      const span = Math.max(max - min, 0.5);
+      // MLX90640 is wired so column 0 is the sensor's right edge when you
+      // look at its front; flip horizontally to match the camera view.
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const v = data[y * W + x];
+          const t = (v - min) / span;
+          const [r, g, b] = lut(t);
+          const o = (y * W + (W - 1 - x)) * 4;
+          img.data[o]     = r;
+          img.data[o + 1] = g;
+          img.data[o + 2] = b;
+          img.data[o + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      document.getElementById('tmin').textContent = min.toFixed(1) + '°C';
+      document.getElementById('tmax').textContent = max.toFixed(1) + '°C';
+      document.getElementById('trange').textContent =
+        'thermal ' + min.toFixed(1) + '–' + max.toFixed(1) + '°C';
+    } catch (e) {
+      document.getElementById('trange').textContent = 'thermal: ' + e.message;
+    }
+  }
+
+  // 4 Hz is plenty — the sensor itself caps at 8 Hz in our default config,
+  // and the JSON is ~6 KB.
+  setInterval(pollThermal, 250);
+  pollThermal();
+
+  // MJPEG framerate indicator: the <img> fires a 'load' event per frame,
+  // but only in some browsers. Estimate visually via requestAnimationFrame
+  // + a heuristic on the element's naturalHeight changes is overkill;
+  // instead, just show the target.
+  const v = document.getElementById('vid');
+  let frames = 0, last = performance.now();
+  // Not all browsers emit a per-frame event for MJPEG <img>. Chromium does
+  // emit repeated 'load' on each part for multipart/x-mixed-replace, so
+  // this works there; elsewhere it shows "~0 fps".
+  v.addEventListener('load', () => { frames++; });
+  setInterval(() => {
+    const now = performance.now();
+    const fps = frames * 1000 / (now - last);
+    document.getElementById('fps').textContent = fps.toFixed(1) + ' fps';
+    frames = 0; last = now;
+  }, 1000);
+})();
+</script>
+</body>
+</html>
