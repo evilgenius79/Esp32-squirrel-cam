@@ -42,22 +42,25 @@ static const char *TAG = "cam";
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    uint8_t  *raw;       // RGB565 or YUV422 buffer from the camera
+    uint8_t  *raw;       // RGB565 / YUV422 buffer from the CSI controller
     size_t    raw_len;
-    uint8_t  *jpg;       // JPEG buffer (we swap between two of these)
+    uint8_t  *jpg;       // JPEG buffer
     size_t    jpg_cap;
     size_t    jpg_len;
 } frame_slot_t;
 
-#define JPG_MAX_BYTES  (CAM_WIDTH * CAM_HEIGHT / 4)  // generous 4:1 floor
+#define JPG_MAX_BYTES   (CAM_WIDTH * CAM_HEIGHT / 4)  // generous 4:1 floor
+#define CAM_SLOT_COUNT  3   // 3-slot ring: writer can be filling slot N+1
+                            // and encoding into slot N+2 while readers are
+                            // still streaming slot N out over the wire.
 
 static esp_cam_ctlr_handle_t   s_cam_ctlr;
 static jpeg_encoder_handle_t   s_jpg;
-static frame_slot_t            s_slot_a, s_slot_b;
-static frame_slot_t * volatile s_latest = NULL;   // most recent JPEG
+
+static frame_slot_t            s_slots[CAM_SLOT_COUNT];
+static volatile int            s_published_idx = -1;
+static volatile uint32_t       s_epoch         = 0;
 static SemaphoreHandle_t       s_publish_mux;
-static SemaphoreHandle_t       s_reader_mux;     // serialises HTTP borrows
-static SemaphoreHandle_t       s_frame_evt;      // signalled when a new JPEG is ready
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -95,13 +98,9 @@ static esp_err_t init_sensor_i2c(i2c_master_bus_handle_t *bus_out,
 // ---------------------------------------------------------------------------
 
 static void capture_task(void *arg) {
-    // Ping-pong between the two slots so the HTTP layer can be reading A
-    // while capture is refilling B.
-    frame_slot_t *slots[2] = { &s_slot_a, &s_slot_b };
     int idx = 0;
-
     while (1) {
-        frame_slot_t *s = slots[idx];
+        frame_slot_t *s = &s_slots[idx];
         esp_cam_ctlr_trans_t tr = {
             .buffer = s->raw,
             .buflen = s->raw_len,
@@ -112,11 +111,11 @@ static void capture_task(void *arg) {
         }
 
         jpeg_encode_cfg_t enc = {
-            .src_type     = JPEG_ENCODE_IN_FORMAT_RGB565,
-            .sub_sample   = JPEG_DOWN_SAMPLING_YUV420,
+            .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
+            .sub_sample    = JPEG_DOWN_SAMPLING_YUV420,
             .image_quality = CAM_JPEG_Q,
-            .width        = CAM_WIDTH,
-            .height       = CAM_HEIGHT,
+            .width         = CAM_WIDTH,
+            .height        = CAM_HEIGHT,
         };
         uint32_t out_size = 0;
         esp_err_t err = jpeg_encoder_process(
@@ -128,12 +127,13 @@ static void capture_task(void *arg) {
         }
         s->jpg_len = out_size;
 
+        // Atomic publish: readers see the new index + epoch together.
         xSemaphoreTake(s_publish_mux, portMAX_DELAY);
-        s_latest = s;
+        s_published_idx = idx;
+        s_epoch++;
         xSemaphoreGive(s_publish_mux);
-        xSemaphoreGive(s_frame_evt);
 
-        idx ^= 1;
+        idx = (idx + 1) % CAM_SLOT_COUNT;
     }
 }
 
@@ -143,21 +143,19 @@ static void capture_task(void *arg) {
 
 esp_err_t camera_start(void) {
     s_publish_mux = xSemaphoreCreateMutex();
-    s_reader_mux  = xSemaphoreCreateMutex();
-    s_frame_evt   = xSemaphoreCreateBinary();
 
-    // Allocate raw + jpeg buffers in PSRAM.
+    // Allocate raw + jpeg buffers in PSRAM, one of each per slot.
     size_t raw_len = CAM_WIDTH * CAM_HEIGHT * 2;  // RGB565 bytes/pixel
-    s_slot_a.raw = psram_alloc(raw_len);
-    s_slot_b.raw = psram_alloc(raw_len);
-    s_slot_a.jpg = psram_alloc(JPG_MAX_BYTES);
-    s_slot_b.jpg = psram_alloc(JPG_MAX_BYTES);
-    if (!s_slot_a.raw || !s_slot_b.raw || !s_slot_a.jpg || !s_slot_b.jpg) {
-        ESP_LOGE(TAG, "out of PSRAM for camera buffers");
-        return ESP_ERR_NO_MEM;
+    for (int i = 0; i < CAM_SLOT_COUNT; ++i) {
+        s_slots[i].raw     = psram_alloc(raw_len);
+        s_slots[i].jpg     = psram_alloc(JPG_MAX_BYTES);
+        s_slots[i].raw_len = raw_len;
+        s_slots[i].jpg_cap = JPG_MAX_BYTES;
+        if (!s_slots[i].raw || !s_slots[i].jpg) {
+            ESP_LOGE(TAG, "out of PSRAM for slot %d", i);
+            return ESP_ERR_NO_MEM;
+        }
     }
-    s_slot_a.raw_len = s_slot_b.raw_len = raw_len;
-    s_slot_a.jpg_cap = s_slot_b.jpg_cap = JPG_MAX_BYTES;
 
     // SCCB + sensor probe.
     i2c_master_bus_handle_t i2c_bus;
@@ -223,29 +221,23 @@ esp_err_t camera_start(void) {
     return ESP_OK;
 }
 
-esp_err_t camera_get_jpeg(const uint8_t **buf, size_t *len, uint32_t timeout_ms) {
-    if (xSemaphoreTake(s_reader_mux, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
+esp_err_t camera_get_jpeg(const uint8_t **buf, size_t *len,
+                          uint32_t *epoch_io, uint32_t timeout_ms) {
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (1) {
+        xSemaphoreTake(s_publish_mux, portMAX_DELAY);
+        int      idx = s_published_idx;
+        uint32_t e   = s_epoch;
+        bool     fresh = (idx >= 0) && (epoch_io == NULL || e != *epoch_io);
+        if (fresh) {
+            *buf = s_slots[idx].jpg;
+            *len = s_slots[idx].jpg_len;
+            if (epoch_io) *epoch_io = e;
+            xSemaphoreGive(s_publish_mux);
+            return ESP_OK;
+        }
+        xSemaphoreGive(s_publish_mux);
+        if (xTaskGetTickCount() >= deadline) return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    // Wait for at least one published frame.
-    if (xSemaphoreTake(s_frame_evt, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        xSemaphoreGive(s_reader_mux);
-        return ESP_ERR_TIMEOUT;
-    }
-    frame_slot_t *s = NULL;
-    xSemaphoreTake(s_publish_mux, portMAX_DELAY);
-    s = (frame_slot_t *)s_latest;
-    xSemaphoreGive(s_publish_mux);
-
-    if (!s) {
-        xSemaphoreGive(s_reader_mux);
-        return ESP_FAIL;
-    }
-    *buf = s->jpg;
-    *len = s->jpg_len;
-    return ESP_OK;
-}
-
-void camera_release(void) {
-    xSemaphoreGive(s_reader_mux);
 }

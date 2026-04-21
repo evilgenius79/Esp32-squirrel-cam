@@ -84,8 +84,10 @@ esp_err_t mlx90640_init(mlx90640_t *m, i2c_master_bus_handle_t bus,
     // terms from EEPROM for absolute accuracy.
     m->vdd0 = 3.3f;
     m->ta0  = 25.0f;
-    // Gain word at EEPROM offset 0x0AA (word 0xAA from 0x2400 base).
-    m->gain = (int16_t)m->ee[0x0AA];
+    // Gain coefficient lives at EEPROM register 0x2430. Our cache starts
+    // at 0x2400, so the array index is 0x30 (= 48). Stored as int16.
+    m->gain = (float)((int16_t)m->ee[0x30]);
+    if (m->gain == 0.0f) m->gain = 1.0f;   // guard against fresh/blank parts
     m->emissivity = 1.0f;
 
     ESP_LOGI(TAG, "mlx90640 detected, gain=%.0f", m->gain);
@@ -149,12 +151,13 @@ esp_err_t mlx90640_read_frame(mlx90640_t *m, float *out,
         // ambient. Enough for a heatmap; swap in the Melexis math if you
         // need absolute accuracy.
         int sp = status & 0x0001;    // which subpage this read belongs to
-        float gain_scale = 1.0f / (m->gain == 0 ? 1.0f : fabsf(m->gain));
+        float gain_scale = 1.0f / fabsf(m->gain);
         float ta = m->ta0 + ((int16_t)aux[0] & 0x03FF) * 0.1f;
         for (int i = 0; i < 32 * 24; ++i) {
-            // Only overwrite pixels that belong to this subpage (chess
-            // pattern: even i = subpage 0, odd i = subpage 1, roughly).
-            if (((i / 32 + i) & 1) != sp) continue;
+            // Chess pattern: pixel (row, col) belongs to subpage 0 if
+            // (row + col) is even, subpage 1 if odd.
+            int row = i / 32, col = i % 32;
+            if (((row + col) & 1) != sp) continue;
             int16_t raw = (int16_t)frame[i];
             out[i] = ta + raw * gain_scale * 0.1f;
         }

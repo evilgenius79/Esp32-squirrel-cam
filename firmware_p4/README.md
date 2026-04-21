@@ -68,6 +68,19 @@ idf.py build
 Once the slave version matches the host component version, WiFi works like
 any other IDF app.
 
+## Web UI
+
+The page at `/` has a small mode switcher in the header:
+
+| Mode      | What it shows                                                  |
+|-----------|----------------------------------------------------------------|
+| **Side**    | Video on the left, thermal heatmap on the right (default).  |
+| **Overlay** | Thermal canvas blended over the video at ~55% opacity, screen blend mode. |
+| **Off**     | Video only. Polling of `/thermal` stops, so the device is not asked to serialise a frame for nothing. |
+
+The choice is remembered in `localStorage` per browser, so a refresh — or
+the kiosk-mode browser on your wall display — keeps the last mode.
+
 ## HTTP endpoints
 
 | Path        | What                                                      |

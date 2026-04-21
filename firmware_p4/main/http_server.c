@@ -64,24 +64,24 @@ static esp_err_t h_stream(httpd_req_t *req) {
 
     char part[64];
     esp_err_t res = ESP_OK;
+    uint32_t epoch = 0;     // per-connection cookie: blocks until a fresh
+                            // frame is available, so we never re-send the
+                            // same JPEG twice and never busy-loop.
     while (1) {
         const uint8_t *buf;
         size_t len;
-        if (camera_get_jpeg(&buf, &len, 1000) != ESP_OK) {
+        if (camera_get_jpeg(&buf, &len, &epoch, 2000) != ESP_OK) {
             res = ESP_FAIL;
             break;
         }
         int hlen = snprintf(part, sizeof(part), MJPEG_PART, (unsigned)len);
         if (hlen <= 0 || hlen >= (int)sizeof(part)) {
-            camera_release();
             res = ESP_FAIL;
             break;
         }
         res = httpd_resp_send_chunk(req, MJPEG_BDY, strlen(MJPEG_BDY));
         if (res == ESP_OK) res = httpd_resp_send_chunk(req, part, hlen);
         if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)buf, len);
-
-        camera_release();
         if (res != ESP_OK) break;
     }
     return res;
@@ -90,16 +90,14 @@ static esp_err_t h_stream(httpd_req_t *req) {
 static esp_err_t h_snapshot(httpd_req_t *req) {
     const uint8_t *buf;
     size_t len;
-    if (camera_get_jpeg(&buf, &len, 2000) != ESP_OK) {
+    if (camera_get_jpeg(&buf, &len, NULL, 2000) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no frame");
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=snap.jpg");
-    esp_err_t res = httpd_resp_send(req, (const char *)buf, len);
-    camera_release();
-    return res;
+    return httpd_resp_send(req, (const char *)buf, len);
 }
 
 static esp_err_t h_thermal(httpd_req_t *req) {
