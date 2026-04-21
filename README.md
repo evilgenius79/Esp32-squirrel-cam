@@ -98,6 +98,32 @@ sudo systemctl enable --now squirrel-cam.service
 The unit assumes a Raspberry Pi OS desktop session owned by user `pi`; adjust
 `User=` and the `DISPLAY`/`XAUTHORITY` variables if your setup differs.
 
+## Security notes
+
+This firmware is designed for a **trusted home LAN**. In particular:
+
+- **No authentication and no TLS.** Anyone on the same WiFi can open
+  `/stream`, `/snapshot`, and `/thermal`. Keep the device on your private
+  network and don't port-forward it. If you need remote access, tunnel
+  through a VPN or reverse-proxy it with auth on the Pi.
+- **WiFi credentials live in `firmware/include/config.h`.** Don't commit your
+  real credentials. Either keep them out of git (e.g. add a
+  `config.local.h` that you `#include` and `.gitignore`) or pass them as
+  build flags:
+
+  ```sh
+  PLATFORMIO_BUILD_FLAGS='-DWIFI_SSID=\"mynet\" -DWIFI_PASSWORD=\"secret\"' \
+    pio run -t upload
+  ```
+
+- `CORS: *` is set on every endpoint so the Pi viewer (and your laptop
+  browser) can fetch JSON from a different origin. Same-network trust
+  still applies.
+- The Pi viewer caps both the MJPEG reassembly buffer (4 MiB) and the
+  `/thermal` response (32 KiB) so a malfunctioning or malicious server on
+  the same LAN can't OOM it.
+- The systemd unit runs as the `pi` user (not root). Leave it that way.
+
 ## Troubleshooting
 
 - **"MLX90640 not found"** — check 3V3, SDA/SCL wiring, and that you wired to

@@ -13,6 +13,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Wire.h>
+#include <stdarg.h>
 #include <esp_camera.h>
 #include <esp_http_server.h>
 #include <Adafruit_MLX90640.h>
@@ -27,10 +28,16 @@
 static Adafruit_MLX90640 mlx;
 static float thermal_frame[32 * 24];
 static SemaphoreHandle_t thermal_mutex = nullptr;
-static volatile float thermal_min = 0.0f;
-static volatile float thermal_max = 0.0f;
-static volatile uint32_t thermal_seq = 0;
+static float thermal_min = 0.0f;
+static float thermal_max = 0.0f;
+static uint32_t thermal_seq = 0;
 static bool mlx_ok = false;
+
+// Reused JSON scratch buffer for /thermal so a request storm can't fragment
+// the heap. Sized for 768 floats @ worst-case 9 chars + commas + header.
+static constexpr size_t THERMAL_JSON_CAP = 8192;
+static char thermal_json_buf[THERMAL_JSON_CAP];
+static SemaphoreHandle_t thermal_json_mutex = nullptr;
 
 static httpd_handle_t server = nullptr;
 
@@ -159,7 +166,13 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) { res = ESP_FAIL; break; }
 
-        size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, fb->len);
+        int hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART,
+                            (unsigned)fb->len);
+        if (hlen <= 0 || hlen >= (int)sizeof(part_buf)) {
+            esp_camera_fb_return(fb);
+            res = ESP_FAIL;
+            break;
+        }
         res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
         if (res == ESP_OK) res = httpd_resp_send_chunk(req, part_buf, hlen);
         if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
@@ -184,6 +197,18 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
     return res;
 }
 
+// Append with overflow guard. Returns false if the write would not fit.
+static bool json_appendf(char *buf, size_t cap, int &off, const char *fmt, ...) {
+    if (off < 0 || (size_t)off >= cap) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - (size_t)off) return false;
+    off += n;
+    return true;
+}
+
 static esp_err_t thermal_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -193,34 +218,43 @@ static esp_err_t thermal_handler(httpd_req_t *req) {
         return httpd_resp_send(req, msg, strlen(msg));
     }
 
-    // Roughly 32*24*6 chars for values + overhead. Allocate generously.
-    const size_t cap = 6500;
-    char *buf = (char *)malloc(cap);
-    if (!buf) { httpd_resp_send_500(req); return ESP_FAIL; }
+    // Serialise access to the shared scratch buffer so concurrent requests
+    // can't scribble over each other.
+    if (xSemaphoreTake(thermal_json_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "busy");
+        return ESP_FAIL;
+    }
 
+    float snap[32 * 24];
     float mn, mx;
     uint32_t seq;
-    float snap[32 * 24];
     if (xSemaphoreTake(thermal_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        free(buf);
-        httpd_resp_send_500(req);
+        xSemaphoreGive(thermal_json_mutex);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no frame");
         return ESP_FAIL;
     }
     memcpy(snap, thermal_frame, sizeof(snap));
     mn = thermal_min; mx = thermal_max; seq = thermal_seq;
     xSemaphoreGive(thermal_mutex);
 
-    int off = snprintf(buf, cap,
+    int off = 0;
+    bool ok = json_appendf(thermal_json_buf, THERMAL_JSON_CAP, off,
         "{\"w\":32,\"h\":24,\"seq\":%u,\"min\":%.2f,\"max\":%.2f,\"data\":[",
-        seq, mn, mx);
-    for (int i = 0; i < 32 * 24 && off < (int)cap - 16; ++i) {
-        off += snprintf(buf + off, cap - off, "%s%.2f",
-                        i == 0 ? "" : ",", snap[i]);
+        (unsigned)seq, mn, mx);
+    for (int i = 0; i < 32 * 24 && ok; ++i) {
+        ok = json_appendf(thermal_json_buf, THERMAL_JSON_CAP, off,
+                          "%s%.2f", i == 0 ? "" : ",", snap[i]);
     }
-    off += snprintf(buf + off, cap - off, "]}");
+    if (ok) ok = json_appendf(thermal_json_buf, THERMAL_JSON_CAP, off, "]}");
 
-    esp_err_t res = httpd_resp_send(req, buf, off);
-    free(buf);
+    esp_err_t res;
+    if (!ok) {
+        res = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                  "json overflow");
+    } else {
+        res = httpd_resp_send(req, thermal_json_buf, off);
+    }
+    xSemaphoreGive(thermal_json_mutex);
     return res;
 }
 
@@ -294,6 +328,7 @@ void setup() {
     log_i("squirrel-cam booting");
 
     thermal_mutex = xSemaphoreCreateMutex();
+    thermal_json_mutex = xSemaphoreCreateMutex();
 
     if (!init_camera()) {
         log_e("camera init failed; halting");

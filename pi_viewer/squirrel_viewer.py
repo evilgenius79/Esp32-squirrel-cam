@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -50,6 +51,13 @@ class Shared:
 # Network workers
 # -----------------------------------------------------------------------------
 
+# Hard cap on the MJPEG reassembly buffer. A well-behaved VGA JPEG is under
+# 100 KB; anything approaching this limit means the stream is corrupt or the
+# server is malicious/broken, and we'd rather drop than OOM the Pi.
+MJPEG_MAX_BUFFER = 4 * 1024 * 1024    # 4 MiB
+MJPEG_MAX_FRAME  = 1 * 1024 * 1024    # 1 MiB
+
+
 def mjpeg_reader(host: str, shared: Shared) -> None:
     """Continuously pull MJPEG frames. Parses the multipart stream by hand
     because requests' iter_content gives us raw bytes and OpenCV decodes
@@ -66,11 +74,23 @@ def mjpeg_reader(host: str, shared: Shared) -> None:
                     if not chunk:
                         continue
                     buf += chunk
+                    # Discard the buffer if it blows past the cap without
+                    # yielding a complete JPEG; a missing EOI marker would
+                    # otherwise grow this unboundedly.
+                    if len(buf) > MJPEG_MAX_BUFFER:
+                        print(f"[mjpeg] buffer overflow ({len(buf)} B); resyncing")
+                        buf = b""
+                        continue
                     while True:
                         start = buf.find(b"\xff\xd8")
                         end = buf.find(b"\xff\xd9", start + 2) if start != -1 else -1
                         if start == -1 or end == -1:
                             break
+                        frame_len = end + 2 - start
+                        if frame_len > MJPEG_MAX_FRAME:
+                            # Oversized frame — skip past the SOI and resync.
+                            buf = buf[start + 2:]
+                            continue
                         jpg = buf[start:end + 2]
                         buf = buf[end + 2:]
                         img = cv2.imdecode(
@@ -86,6 +106,10 @@ def mjpeg_reader(host: str, shared: Shared) -> None:
             time.sleep(2)
 
 
+THERMAL_MAX_BYTES = 32 * 1024   # a well-formed payload is ~6 KB
+THERMAL_W, THERMAL_H = 32, 24
+
+
 def thermal_reader(host: str, shared: Shared, hz: float = 8.0) -> None:
     url = f"http://{host}/thermal"
     period = 1.0 / hz
@@ -93,14 +117,38 @@ def thermal_reader(host: str, shared: Shared, hz: float = 8.0) -> None:
     while not shared.stop.is_set():
         t0 = time.time()
         try:
-            r = requests.get(url, timeout=3)
-            r.raise_for_status()
-            j = r.json()
-            if "error" in j:
+            # Stream the body so we can cap how many bytes we accept before
+            # handing anything to the JSON parser.
+            with requests.get(url, timeout=3, stream=True) as r:
+                r.raise_for_status()
+                body = bytearray()
+                oversized = False
+                for chunk in r.iter_content(chunk_size=4096):
+                    if chunk:
+                        body.extend(chunk)
+                    if len(body) > THERMAL_MAX_BYTES:
+                        oversized = True
+                        break
+            if oversized:
+                print(f"[thermal] payload too large (>{THERMAL_MAX_BYTES} B); dropping")
+                time.sleep(1)
+                continue
+            j = json.loads(body)
+
+            if isinstance(j, dict) and "error" in j:
                 print(f"[thermal] device says: {j['error']}")
                 time.sleep(2)
                 continue
-            arr = np.asarray(j["data"], dtype=np.float32).reshape(j["h"], j["w"])
+            # Validate shape before trusting it.
+            if (not isinstance(j, dict)
+                    or j.get("w") != THERMAL_W or j.get("h") != THERMAL_H
+                    or not isinstance(j.get("data"), list)
+                    or len(j["data"]) != THERMAL_W * THERMAL_H):
+                print("[thermal] unexpected payload shape; dropping")
+                time.sleep(1)
+                continue
+
+            arr = np.asarray(j["data"], dtype=np.float32).reshape(THERMAL_H, THERMAL_W)
             seq = int(j.get("seq", last_seq + 1))
             if seq != last_seq:
                 last_seq = seq
